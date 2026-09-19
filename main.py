@@ -7,6 +7,7 @@ precios históricos y datos fundamentales de una acción.
 
 import os
 import requests
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -44,6 +45,45 @@ def fmp_get(endpoint: str, params: dict) -> dict:
     return response.json()
 
 
+def calcular_indicadores(precios: list) -> list:
+    """
+    Recibe la lista de precios históricos (más reciente primero, como los
+    devuelve FMP) y le agrega, a cada día, la media móvil de 20 y 50 días
+    y el RSI de 14 días. Estos son los indicadores técnicos más usados
+    para leer el "momentum" de una acción.
+    """
+    if not precios:
+        return precios
+
+    # Pasamos a pandas y damos vuelta el orden (más antiguo primero),
+    # porque los indicadores se calculan mirando hacia atrás en el tiempo.
+    df = pd.DataFrame(precios)
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    df["sma_20"] = df["close"].rolling(window=20).mean()
+    df["sma_50"] = df["close"].rolling(window=50).mean()
+
+    # RSI (Relative Strength Index): mide si una acción está "sobrecomprada"
+    # (arriba de 70) o "sobrevendida" (debajo de 30) en los últimos 14 días.
+    delta = df["close"].diff()
+    ganancia = delta.clip(lower=0)
+    perdida = -delta.clip(upper=0)
+    media_ganancia = ganancia.rolling(window=14).mean()
+    media_perdida = perdida.rolling(window=14).mean()
+    rs = media_ganancia / media_perdida
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # Redondeamos y volvemos a dejar los datos en orden más reciente primero
+    df = df.round({"sma_20": 2, "sma_50": 2, "rsi_14": 2})
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    # NaN (los primeros días, que no tienen suficiente historia para calcular)
+    # los convertimos a None para que sean JSON válido. Hace falta pasar a
+    # tipo "object" primero, porque si no pandas vuelve a convertir None en NaN.
+    df = df.astype(object).where(pd.notnull(df), None)
+    return df.to_dict(orient="records")
+
+
 @app.get("/")
 def home():
     """Endpoint de prueba: si esto responde, el backend está vivo."""
@@ -63,6 +103,24 @@ def obtener_precios(ticker: str, dias: int = 180):
         data = data[:dias]
 
     return {"ticker": ticker.upper(), "precios": data}
+
+
+@app.get("/indicadores/{ticker}")
+def obtener_indicadores(ticker: str, dias: int = 180):
+    """
+    Devuelve los precios históricos ya con los indicadores técnicos
+    (medias móviles de 20 y 50 días, RSI de 14 días) calculados.
+    Ejemplo de uso: /indicadores/AAPL?dias=90
+    """
+    data = fmp_get("historical-price-eod/full", {"symbol": ticker.upper()})
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail="Respuesta inesperada de FMP")
+
+    con_indicadores = calcular_indicadores(data)
+    con_indicadores = con_indicadores[:dias]
+
+    return {"ticker": ticker.upper(), "precios": con_indicadores}
 
 
 @app.get("/fundamental/{ticker}")
