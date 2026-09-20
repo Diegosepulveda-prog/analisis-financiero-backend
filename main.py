@@ -360,15 +360,16 @@ def obtener_indicadores(ticker: str, dias: int = 180):
 
 
 @app.get("/valor-intrinseco/{ticker}")
-def obtener_valor_intrinseco(ticker: str):
+def obtener_valor_intrinseco(ticker: str, forzar: bool = False):
     """
     Devuelve el valor intrínseco de una empresa calculado con un modelo
     de flujo de caja descontado (DCF), comparado contra el precio actual
     de mercado. Usa la misma caché de 24hs que los demás endpoints.
-    Ejemplo de uso: /valor-intrinseco/AAPL
+    Agregá ?forzar=true a la URL para ignorar la caché y recalcular.
+    Ejemplo de uso: /valor-intrinseco/AAPL?forzar=true
     """
     ticker = ticker.upper()
-    resultado = leer_cache(ticker, "valor_intrinseco")
+    resultado = None if forzar else leer_cache(ticker, "valor_intrinseco")
 
     if resultado is None:
         resultado = calcular_valor_intrinseco(ticker)
