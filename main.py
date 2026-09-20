@@ -278,10 +278,17 @@ def calcular_valor_intrinseco(ticker: str) -> dict:
     valor_empresa = valor_presente_flujos + valor_presente_terminal  # Enterprise Value
     valor_patrimonio = valor_empresa - deuda_total + efectivo  # Equity Value
 
-    acciones_en_circulacion = perfil.get("sharesOutstanding") or balance.get("commonStock") or 1
-    valor_intrinseco_por_accion = valor_patrimonio / acciones_en_circulacion if acciones_en_circulacion else None
-
     precio_actual = perfil.get("price")
+    acciones_en_circulacion = None
+    if market_cap and precio_actual:
+        acciones_en_circulacion = market_cap / precio_actual
+    elif perfil.get("sharesOutstanding"):
+        acciones_en_circulacion = perfil["sharesOutstanding"]
+
+    valor_intrinseco_por_accion = (
+        valor_patrimonio / acciones_en_circulacion if acciones_en_circulacion else None
+    )
+
     diferencia_pct = (
         ((valor_intrinseco_por_accion - precio_actual) / precio_actual) * 100
         if valor_intrinseco_por_accion and precio_actual else None
