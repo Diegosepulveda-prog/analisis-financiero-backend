@@ -182,6 +182,133 @@ def calcular_indicadores(precios: list) -> list:
     return df.to_dict(orient="records")
 
 
+def calcular_valor_intrinseco(ticker: str) -> dict:
+    """
+    Calcula el valor intrínseco de una empresa usando un modelo de flujo
+    de caja descontado (DCF - Discounted Cash Flow). Es el método clásico
+    de análisis fundamental: proyecta el efectivo que va a generar la
+    empresa en el futuro y lo "trae a valor de hoy".
+
+    Simplificaciones que hacemos para que el modelo sea manejable:
+    - Tasa libre de riesgo fija en 4.5% (aproximación al bono del Tesoro de EE.UU.)
+    - Prima de riesgo de mercado fija en 5% (promedio histórico usual)
+    - Proyectamos 5 años, con la tasa de crecimiento histórica de la empresa
+    - Tasa de crecimiento a perpetuidad (terminal) fija en 2.5% (similar a
+      la inflación de largo plazo esperada)
+    """
+    TASA_LIBRE_DE_RIESGO = 0.045
+    PRIMA_DE_RIESGO_MERCADO = 0.05
+    CRECIMIENTO_TERMINAL = 0.025
+    ANIOS_DE_PROYECCION = 5
+
+    perfil_resp = fmp_get("profile", {"symbol": ticker})
+    flujo_caja_resp = fmp_get("cash-flow-statement", {"symbol": ticker, "limit": 5})
+    balance_resp = fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": 1})
+    resultados_resp = fmp_get("income-statement", {"symbol": ticker, "limit": 1})
+
+    if not perfil_resp or not flujo_caja_resp or not balance_resp:
+        raise HTTPException(status_code=502, detail="No hay suficientes datos financieros para calcular el DCF")
+
+    perfil = perfil_resp[0]
+    balance = balance_resp[0]
+    resultados = resultados_resp[0] if resultados_resp else {}
+
+    # Flujo de caja libre (FCF) = efectivo generado por el negocio menos
+    # lo que reinvierte en bienes de capital (maquinaria, equipos, etc.)
+    flujos_libres = [
+        (fila.get("operatingCashFlow") or fila.get("freeCashFlow") or 0)
+        - abs(fila.get("capitalExpenditure") or 0)
+        for fila in reversed(flujo_caja_resp)  # del más antiguo al más reciente
+    ]
+    if not flujos_libres or all(f == 0 for f in flujos_libres):
+        raise HTTPException(status_code=502, detail="FMP no devolvió datos de flujo de caja utilizables para este ticker")
+
+    # Tasa de crecimiento promedio histórica entre años consecutivos
+    tasas_crecimiento = [
+        (flujos_libres[i] - flujos_libres[i - 1]) / abs(flujos_libres[i - 1])
+        for i in range(1, len(flujos_libres))
+        if flujos_libres[i - 1] != 0
+    ]
+    crecimiento_estimado = sum(tasas_crecimiento) / len(tasas_crecimiento) if tasas_crecimiento else 0.05
+    # Topamos el crecimiento a un rango razonable (-10% a 20%) para evitar
+    # que un salto puntual en los datos históricos distorsione todo el modelo
+    crecimiento_estimado = max(-0.10, min(0.20, crecimiento_estimado))
+
+    # WACC (Weighted Average Cost of Capital): mezcla el costo de financiarse
+    # con capital propio (acciones) y con deuda, ponderado por cuánto pesa
+    # cada uno en la estructura de la empresa.
+    beta = perfil.get("beta") or 1.0
+    costo_capital_propio = TASA_LIBRE_DE_RIESGO + beta * PRIMA_DE_RIESGO_MERCADO
+
+    deuda_total = balance.get("totalDebt", 0) or 0
+    efectivo = balance.get("cashAndCashEquivalents", 0) or 0
+    market_cap = perfil.get("marketCap", 0) or 0
+
+    gasto_intereses = abs(resultados.get("interestExpense", 0) or 0)
+    tasa_impositiva = resultados.get("incomeTaxExpense", 0) / resultados["incomeBeforeTax"] \
+        if resultados.get("incomeBeforeTax") else 0.21  # 21% como default razonable
+    tasa_impositiva = max(0, min(0.40, tasa_impositiva))
+
+    costo_deuda = (gasto_intereses / deuda_total) if deuda_total else 0.05
+    costo_deuda_despues_impuestos = costo_deuda * (1 - tasa_impositiva)
+
+    valor_total = market_cap + deuda_total
+    peso_capital = (market_cap / valor_total) if valor_total else 1
+    peso_deuda = (deuda_total / valor_total) if valor_total else 0
+
+    wacc = (peso_capital * costo_capital_propio) + (peso_deuda * costo_deuda_despues_impuestos)
+    wacc = max(0.04, min(0.20, wacc))  # límites de sanidad
+
+    # Proyectamos los flujos de los próximos 5 años y los descontamos a valor presente
+    ultimo_flujo = flujos_libres[-1]
+    flujos_proyectados = []
+    valor_presente_flujos = 0
+    for anio in range(1, ANIOS_DE_PROYECCION + 1):
+        flujo_futuro = ultimo_flujo * ((1 + crecimiento_estimado) ** anio)
+        valor_presente = flujo_futuro / ((1 + wacc) ** anio)
+        flujos_proyectados.append({"anio": anio, "flujo_proyectado": round(flujo_futuro, 0), "valor_presente": round(valor_presente, 0)})
+        valor_presente_flujos += valor_presente
+
+    # Valor terminal: todo lo que la empresa genera después del año 5,
+    # asumiendo que a partir de ahí crece a un ritmo estable para siempre
+    flujo_terminal = flujos_proyectados[-1]["flujo_proyectado"] * (1 + CRECIMIENTO_TERMINAL)
+    valor_terminal = flujo_terminal / (wacc - CRECIMIENTO_TERMINAL)
+    valor_presente_terminal = valor_terminal / ((1 + wacc) ** ANIOS_DE_PROYECCION)
+
+    valor_empresa = valor_presente_flujos + valor_presente_terminal  # Enterprise Value
+    valor_patrimonio = valor_empresa - deuda_total + efectivo  # Equity Value
+
+    acciones_en_circulacion = perfil.get("sharesOutstanding") or balance.get("commonStock") or 1
+    valor_intrinseco_por_accion = valor_patrimonio / acciones_en_circulacion if acciones_en_circulacion else None
+
+    precio_actual = perfil.get("price")
+    diferencia_pct = (
+        ((valor_intrinseco_por_accion - precio_actual) / precio_actual) * 100
+        if valor_intrinseco_por_accion and precio_actual else None
+    )
+
+    return {
+        "ticker": ticker,
+        "precio_actual": precio_actual,
+        "valor_intrinseco_por_accion": round(valor_intrinseco_por_accion, 2) if valor_intrinseco_por_accion else None,
+        "diferencia_porcentual": round(diferencia_pct, 2) if diferencia_pct is not None else None,
+        "veredicto": (
+            "subvaluada" if diferencia_pct and diferencia_pct > 10 else
+            "sobrevaluada" if diferencia_pct and diferencia_pct < -10 else
+            "valuada razonablemente" if diferencia_pct is not None else None
+        ),
+        "supuestos": {
+            "wacc": round(wacc * 100, 2),
+            "crecimiento_estimado_fcf": round(crecimiento_estimado * 100, 2),
+            "crecimiento_terminal": round(CRECIMIENTO_TERMINAL * 100, 2),
+            "beta": beta,
+        },
+        "flujos_proyectados": flujos_proyectados,
+        "valor_terminal_presente": round(valor_presente_terminal, 0),
+        "valor_empresa": round(valor_empresa, 0),
+    }
+
+
 @app.get("/")
 def home():
     """Endpoint de prueba: si esto responde, el backend está vivo."""
@@ -225,7 +352,22 @@ def obtener_indicadores(ticker: str, dias: int = 180):
     return {"ticker": ticker, "precios": con_indicadores[:dias]}
 
 
-@app.get("/fundamental/{ticker}")
+@app.get("/valor-intrinseco/{ticker}")
+def obtener_valor_intrinseco(ticker: str):
+    """
+    Devuelve el valor intrínseco de una empresa calculado con un modelo
+    de flujo de caja descontado (DCF), comparado contra el precio actual
+    de mercado. Usa la misma caché de 24hs que los demás endpoints.
+    Ejemplo de uso: /valor-intrinseco/AAPL
+    """
+    ticker = ticker.upper()
+    resultado = leer_cache(ticker, "valor_intrinseco")
+
+    if resultado is None:
+        resultado = calcular_valor_intrinseco(ticker)
+        guardar_cache(ticker, "valor_intrinseco", resultado)
+
+    return resultado
 def obtener_fundamental(ticker: str):
     """
     Devuelve un resumen de datos fundamentales: ratios clave y perfil de
